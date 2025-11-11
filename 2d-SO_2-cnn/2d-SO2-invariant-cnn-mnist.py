@@ -96,12 +96,11 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
     total_batches = len(train_loader)
     for batch_idx, (data, target) in enumerate(train_loader, 1):
         data, target = data.to(device), target.to(device)
-
         geo_data = enn.GeometricTensor(data, model.in_type)
 
         optimizer.zero_grad()
         output = model(geo_data)
-        loss = criterion(output, F.one_hot(target, num_classes=output.shape[1]).float())
+        loss = criterion(output, target)   # ✅ Direct targets
         loss.backward()
         optimizer.step()
 
@@ -111,8 +110,7 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
             avg_loss = running_loss / batch_idx
             print(f"[Train] Epoch {epoch} Batch {batch_idx}/{total_batches} — Avg Loss: {avg_loss:.4f}")
 
-    avg_loss = running_loss / total_batches
-    print(f"[Train] Epoch {epoch} Completed — Avg Loss: {avg_loss:.4f}")
+    print(f"[Train] Epoch {epoch} Completed — Avg Loss: {running_loss / total_batches:.4f}")
 
 
 # ---------------------------------------------------------------------
@@ -224,7 +222,7 @@ def main():
 
     model = InvariantEquivariantNet(N=args.N).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    criterion = nn.CrossEntropyLoss()
 
     model_path = f"so2_invariant_cnn_mnist_N{args.N}.pt"
 
