@@ -186,7 +186,7 @@ def main():
     parser = argparse.ArgumentParser(description="SO(2) invariant CNN on rotated MNIST.")
     parser.add_argument("--N", type=int, default=8, help="Number of discrete rotations (default 8)")
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--viz", action="store_true", help="Visualize sample images and rotations")
     args = parser.parse_args()
