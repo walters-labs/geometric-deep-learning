@@ -1,244 +1,136 @@
-"""
-2d-SO2-invariant-cnn-mnist.py
-
-A 2D rotation-invariant CNN using e2cnn trained on rotated MNIST.
-
-- Uses discrete rotations matching the group order N.
-- Applies GroupPooling for invariance.
-- Trains on MNIST augmented with discrete rotations.
-- Tests invariance on random test samples.
-- Saves and loads model checkpoints.
-- Optionally visualizes inputs.
-
-Requirements:
-    pip install torch torchvision e2cnn matplotlib numpy pillow
-
-Run:
-    python 2d-SO2-invariant-cnn-mnist.py --N 8 --epochs 5 --viz
-"""
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from e2cnn import gspaces
-from e2cnn import nn as enn
+import torch.optim as optim
 from torchvision import datasets, transforms
-import numpy as np
-import argparse
-from PIL import Image
-import random
+import e2cnn.nn as enn
+from e2cnn import gspaces
+from tqdm import tqdm
 import os
 
-
-def pil_rotate(arr, angle):
-    """
-    Rotate a numpy image array (values [0,1]) by angle degrees using PIL.
-    """
-    pil = Image.fromarray((arr * 255).astype(np.uint8))
-    pil_r = pil.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=0)
-    return np.array(pil_r).astype(np.float32) / 255.0
-
-
-# ---------------------------------------------------------------------
-# Custom transform: discrete rotation by multiples of 360/N degrees
-# ---------------------------------------------------------------------
-class DiscreteRotation:
-    def __init__(self, N=4):
-        self.N = N
-        self.angles = [360.0 * k / N for k in range(N)]
-
-    def __call__(self, img):
-        angle = random.choice(self.angles)
-        return img.rotate(angle, resample=Image.BILINEAR)
-
-
-# ---------------------------------------------------------------------
-# Model: equivariant + invariant CNN
-# ---------------------------------------------------------------------
-class InvariantEquivariantNet(nn.Module):
-    def __init__(self, N=4, n_classes=10):
+# ============================================================
+# Model definition
+# ============================================================
+class SO2InvariantCNN(nn.Module):
+    def __init__(self, N=8):
         super().__init__()
-        self.N = N
         self.gspace = gspaces.Rot2dOnR2(N=N)
 
         in_type = enn.FieldType(self.gspace, [self.gspace.trivial_repr])
-        out1 = enn.FieldType(self.gspace, [self.gspace.regular_repr])
-        out2 = enn.FieldType(self.gspace, [self.gspace.regular_repr])
+        out1 = enn.FieldType(self.gspace, 8 * [self.gspace.regular_repr])
+        out2 = enn.FieldType(self.gspace, 16 * [self.gspace.regular_repr])
+        out3 = enn.FieldType(self.gspace, 16 * [self.gspace.regular_repr])
 
-        self.block1 = enn.R2Conv(in_type, out1, kernel_size=7, padding=3, bias=False)
-        self.relu1 = enn.ReLU(out1, inplace=True)
-        self.block2 = enn.R2Conv(out1, out2, kernel_size=5, padding=2, bias=False)
-        self.relu2 = enn.ReLU(out2, inplace=True)
+        self.block1 = enn.SequentialModule(
+            enn.R2Conv(in_type, out1, kernel_size=5, padding=2, bias=False),
+            enn.InnerBatchNorm(out1),
+            enn.ReLU(out1, inplace=True),
+            enn.PointwiseMaxPool(out1, 2)
+        )
 
-        self.gpool = enn.GroupPooling(out2)
+        self.block2 = enn.SequentialModule(
+            enn.R2Conv(out1, out2, kernel_size=5, padding=2, bias=False),
+            enn.InnerBatchNorm(out2),
+            enn.ReLU(out2, inplace=True),
+            enn.PointwiseMaxPool(out2, 2)
+        )
 
-        # Fix here: use output size after group pooling
-        self.fc = nn.Linear(self.gpool.out_type.size, n_classes)
+        self.block3 = enn.SequentialModule(
+            enn.R2Conv(out2, out3, kernel_size=5, padding=2, bias=False),
+            enn.InnerBatchNorm(out3),
+            enn.ReLU(out3, inplace=True),
+            enn.PointwiseAdaptiveAvgPool(out3, output_size=1)
+        )
 
-        self.in_type = in_type
-        self.out_type = out2
+        self.gpool = enn.GroupPooling(out3)
+        self.fc = nn.Linear(16, 10)
 
-    def forward(self, geo_x):
-        x = self.relu1(self.block1(geo_x))
-        x = self.relu2(self.block2(x))
+    def forward(self, x):
+        x = enn.GeometricTensor(x, self.block1.in_type)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
         x = self.gpool(x)
-        t = x.tensor.mean(dim=[2, 3])  # Global average pool spatial dims
-        return self.fc(t)
+        x = x.tensor.view(x.tensor.size(0), -1)
+        return self.fc(x)
 
-
-# ---------------------------------------------------------------------
-# Train function with batch-level updates
-# ---------------------------------------------------------------------
+# ============================================================
+# Training and Testing
+# ============================================================
 def train(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
-    running_loss = 0
-    total_batches = len(train_loader)
-    for batch_idx, (data, target) in enumerate(train_loader, 1):
+    total_loss = 0
+    for data, target in tqdm(train_loader, desc=f"[Train] Epoch {epoch}"):
         data, target = data.to(device), target.to(device)
-        geo_data = enn.GeometricTensor(data, model.in_type)
-
         optimizer.zero_grad()
-        output = model(geo_data)
-        loss = criterion(output, target)   # ✅ Direct targets
+        output = model(data)
+        loss = criterion(output, target)
         loss.backward()
         optimizer.step()
+        total_loss += loss.item()
+    print(f"[Train] Epoch {epoch} — Avg Loss: {total_loss / len(train_loader):.4f}")
 
-        running_loss += loss.item()
-
-        if batch_idx % 20 == 0 or batch_idx == total_batches:
-            avg_loss = running_loss / batch_idx
-            print(f"[Train] Epoch {epoch} Batch {batch_idx}/{total_batches} — Avg Loss: {avg_loss:.4f}")
-
-    print(f"[Train] Epoch {epoch} Completed — Avg Loss: {running_loss / total_batches:.4f}")
-
-
-# ---------------------------------------------------------------------
-# Test function with batch-level accuracy updates
-# ---------------------------------------------------------------------
 def test(model, device, test_loader):
     model.eval()
     correct = 0
-    total = 0
-    total_batches = len(test_loader)
     with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(test_loader, 1):
+        for data, target in tqdm(test_loader, desc="[Test]"):
             data, target = data.to(device), target.to(device)
-            geo_data = enn.GeometricTensor(data, model.in_type)
-            output = model(geo_data)
-            pred = output.argmax(dim=1)
-            correct += (pred == target).sum().item()
-            total += target.size(0)
-
-            if batch_idx % 10 == 0 or batch_idx == total_batches:
-                acc_so_far = correct / total * 100
-                print(f"[Test] Batch {batch_idx}/{total_batches} — Accuracy so far: {acc_so_far:.2f}%")
-
-    acc = correct / total
-    print(f"[Test] Final Accuracy: {acc*100:.2f}%")
+            output = model(data)
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    acc = 100.0 * correct / len(test_loader.dataset)
+    print(f"[Test] Accuracy: {acc:.2f}%")
     return acc
 
-
-# ---------------------------------------------------------------------
-# Invariance tests on single sample
-# ---------------------------------------------------------------------
-def test_invariance(model, device, N, noise=0.01, viz=False):
-    model.eval()
-    mnist_test = datasets.MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
-    img, label = mnist_test[0]  # first test sample, tensor [1,28,28]
-    img = img.squeeze(0).numpy()
-
-    img_pil = Image.fromarray((img * 255).astype(np.uint8)).resize((64, 64), Image.BILINEAR)
-    img_np = np.array(img_pil).astype(np.float32) / 255.0
-
-    img_np += noise * np.random.randn(*img_np.shape)
-    img_np = np.clip(img_np, 0, 1)
-
-    X = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0).to(device)
-    geo_X = enn.GeometricTensor(X, model.in_type)
-    base_out = model(geo_X).detach()
-
-    print("\n=== Invariance Tests on MNIST sample ===")
-    angles = [360.0 * k / N for k in range(N)]
-    for angle in angles:
-        img_r = pil_rotate(img_np, angle=angle)
-        Xr = torch.from_numpy(img_r).unsqueeze(0).unsqueeze(0).to(device)
-        geo_Xr = enn.GeometricTensor(Xr, model.in_type)
-        out_r = model(geo_Xr).detach()
-
-        diff = (out_r - base_out).abs()
-        print(f"Rotation {angle:6.1f}° | max diff: {diff.max():.3e} | mean diff: {diff.mean():.3e}")
-
-        tol = 1e-3
-        if diff.max() > tol:
-            print(f"⚠️ Warning: Invariance test failed at rotation {angle}°")
-
-    if viz:
-        plt.figure(figsize=(8, 4))
-        plt.subplot(1, 2, 1)
-        plt.title(f"Original (label {label})")
-        plt.imshow(img_np, cmap="gray")
-        plt.axis("off")
-        plt.subplot(1, 2, 2)
-        plt.title(f"Rotated {angles[1]:.1f}°")
-        plt.imshow(pil_rotate(img_np, angles[1]), cmap="gray")
-        plt.axis("off")
-        plt.show()
-
-
-# ---------------------------------------------------------------------
-# Main entry
-# ---------------------------------------------------------------------
+# ============================================================
+# Main
+# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="SO(2) invariant CNN on rotated MNIST.")
-    parser.add_argument("--N", type=int, default=8, help="Number of discrete rotations (default 8)")
-    parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--viz", action="store_true", help="Visualize sample images and rotations")
-    parser.add_argument("--save-model", action="store_true", help="Save model after training")
-    parser.add_argument("--load-model", action="store_true", help="Load model before training (skip training if loaded)")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_transform = transforms.Compose([
-        DiscreteRotation(N=args.N),
-        transforms.Resize(64),
+    os.makedirs("models", exist_ok=True)
+
+    transform = transforms.Compose([
+        transforms.Resize(32),
         transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    test_transform = transforms.Compose([
-        transforms.Resize(64),
-        transforms.ToTensor(),
-    ])
+    train_loader = torch.utils.data.DataLoader(
+        datasets.MNIST("./data", train=True, download=True, transform=transform),
+        batch_size=64, shuffle=True
+    )
 
-    train_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=train_transform)
-    test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=test_transform)
+    test_loader = torch.utils.data.DataLoader(
+        datasets.MNIST("./data", train=False, transform=transform),
+        batch_size=64, shuffle=False
+    )
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
-    model = InvariantEquivariantNet(N=args.N).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = SO2InvariantCNN(N=8).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
-    model_path = f"models/so2_invariant_cnn_mnist_N{args.N}.pt"
+    # Optionally load latest checkpoint
+    checkpoints = sorted(
+        [f for f in os.listdir("models") if f.startswith("so2_invariant_cnn_epoch")],
+        key=lambda x: int(x.split("epoch")[1].split(".")[0])
+    )
 
-    if args.load_model and os.path.exists(model_path):
-        print(f"Loading model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=device))
-    else:
-        for epoch in range(1, args.epochs + 1):
-            train(model, device, train_loader, optimizer, criterion, epoch)
-            test(model, device, test_loader)
-        if args.save_model:
-            print(f"Saving model to {model_path}")
-            torch.save(model.state_dict(), model_path)
+    start_epoch = 1
+    if checkpoints:
+        latest = checkpoints[-1]
+        print(f"Loading checkpoint: {latest}")
+        model.load_state_dict(torch.load(f"models/{latest}", map_location=device))
+        start_epoch = int(latest.split("epoch")[1].split(".")[0]) + 1
 
-    test_invariance(model, device, args.N, noise=0.01, viz=args.viz)
+    for epoch in range(start_epoch, start_epoch + 3):
+        train(model, device, train_loader, optimizer, criterion, epoch)
+        acc = test(model, device, test_loader)
 
+        save_path = f"models/so2_invariant_cnn_epoch{epoch}.pt"
+        torch.save(model.state_dict(), save_path)
+        print(f"✅ Model saved to {save_path} (accuracy: {acc:.2f}%)")
 
 if __name__ == "__main__":
     main()
