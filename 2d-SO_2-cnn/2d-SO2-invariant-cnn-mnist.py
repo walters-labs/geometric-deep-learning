@@ -224,7 +224,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
-    model_path = f"so2_invariant_cnn_mnist_N{args.N}.pt"
+    model_path = f"models/so2_invariant_cnn_mnist_N{args.N}.pt"
 
     if args.load_model and os.path.exists(model_path):
         print(f"Loading model from {model_path}")
