@@ -7,6 +7,7 @@ A 2D rotation-invariant CNN using e2cnn trained on rotated MNIST.
 - Applies GroupPooling for invariance.
 - Trains on MNIST augmented with discrete rotations.
 - Tests invariance on random test samples.
+- Saves and loads model checkpoints.
 - Optionally visualizes inputs.
 
 Requirements:
@@ -27,6 +28,7 @@ import numpy as np
 import argparse
 from PIL import Image
 import random
+import os
 
 
 def pil_rotate(arr, angle):
@@ -70,7 +72,9 @@ class InvariantEquivariantNet(nn.Module):
         self.relu2 = enn.ReLU(out2, inplace=True)
 
         self.gpool = enn.GroupPooling(out2)
-        self.fc = nn.Linear(1, n_classes)
+
+        # Fix here: use output size after group pooling
+        self.fc = nn.Linear(self.gpool.out_type.size, n_classes)
 
         self.in_type = in_type
         self.out_type = out2
@@ -79,7 +83,7 @@ class InvariantEquivariantNet(nn.Module):
         x = self.relu1(self.block1(geo_x))
         x = self.relu2(self.block2(x))
         x = self.gpool(x)
-        t = x.tensor.mean(dim=[2, 3])
+        t = x.tensor.mean(dim=[2, 3])  # Global average pool spatial dims
         return self.fc(t)
 
 
@@ -142,20 +146,16 @@ def test(model, device, test_loader):
 # ---------------------------------------------------------------------
 def test_invariance(model, device, N, noise=0.01, viz=False):
     model.eval()
-    # Use a sample MNIST digit from test set
     mnist_test = datasets.MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
     img, label = mnist_test[0]  # first test sample, tensor [1,28,28]
     img = img.squeeze(0).numpy()
 
-    # Resize to 64x64 for model input
     img_pil = Image.fromarray((img * 255).astype(np.uint8)).resize((64, 64), Image.BILINEAR)
     img_np = np.array(img_pil).astype(np.float32) / 255.0
 
-    # Add noise
     img_np += noise * np.random.randn(*img_np.shape)
     img_np = np.clip(img_np, 0, 1)
 
-    # Base output
     X = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0).to(device)
     geo_X = enn.GeometricTensor(X, model.in_type)
     base_out = model(geo_X).detach()
@@ -198,12 +198,13 @@ def main():
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--viz", action="store_true", help="Visualize sample images and rotations")
+    parser.add_argument("--save-model", action="store_true", help="Save model after training")
+    parser.add_argument("--load-model", action="store_true", help="Load model before training (skip training if loaded)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Define transform with discrete rotation augmentation
     train_transform = transforms.Compose([
         DiscreteRotation(N=args.N),
         transforms.Resize(64),
@@ -215,25 +216,29 @@ def main():
         transforms.ToTensor(),
     ])
 
-    # Load datasets
     train_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=train_transform)
     test_dataset = datasets.MNIST(root="./data", train=False, download=True, transform=test_transform)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # Instantiate model
     model = InvariantEquivariantNet(N=args.N).to(device)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
-    # Training loop
-    for epoch in range(1, args.epochs + 1):
-        train(model, device, train_loader, optimizer, criterion, epoch)
-        test(model, device, test_loader)
+    model_path = f"so2_invariant_cnn_mnist_N{args.N}.pt"
 
-    # Invariance test on one sample
+    if args.load_model and os.path.exists(model_path):
+        print(f"Loading model from {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    else:
+        for epoch in range(1, args.epochs + 1):
+            train(model, device, train_loader, optimizer, criterion, epoch)
+            test(model, device, test_loader)
+        if args.save_model:
+            print(f"Saving model to {model_path}")
+            torch.save(model.state_dict(), model_path)
+
     test_invariance(model, device, args.N, noise=0.01, viz=args.viz)
 
 
