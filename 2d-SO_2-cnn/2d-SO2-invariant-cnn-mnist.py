@@ -29,6 +29,15 @@ from PIL import Image
 import random
 
 
+def pil_rotate(arr, angle):
+    """
+    Rotate a numpy image array (values [0,1]) by angle degrees using PIL.
+    """
+    pil = Image.fromarray((arr * 255).astype(np.uint8))
+    pil_r = pil.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=0)
+    return np.array(pil_r).astype(np.float32) / 255.0
+
+
 # ---------------------------------------------------------------------
 # Custom transform: discrete rotation by multiples of 360/N degrees
 # ---------------------------------------------------------------------
